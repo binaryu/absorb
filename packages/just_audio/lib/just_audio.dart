@@ -173,6 +173,8 @@ class AudioPlayer {
   WebCrossOrigin? _webCrossOrigin;
   String _webSinkId = '';
   final bool _androidApplyAudioAttributes;
+  JustAudioPlatform? _sourcePlatform;
+  int _sourceRequest = 0;
   final bool _handleAudioSessionActivation;
 
   /// Counts how many times [_setPlatformActive] is called.
@@ -815,8 +817,19 @@ class AudioPlayer {
     bool preload = true,
     int? initialIndex,
     Duration? initialPosition,
+    JustAudioPlatform? platformOverride,
   }) async {
     if (_disposed) return null;
+    final request = ++_sourceRequest;
+    if (!identical(_sourcePlatform, platformOverride)) {
+      // Dispose the old backend before changing the owner of this player ID.
+      await _stop();
+      await _platform;
+      if (_disposed || request != _sourceRequest) {
+        throw PlayerInterruptedException('Loading interrupted');
+      }
+      _sourcePlatform = platformOverride;
+    }
     _audioSource = null;
     _initialSeekValues =
         _InitialSeekValues(position: initialPosition, index: initialIndex);
@@ -1054,6 +1067,11 @@ class AudioPlayer {
   /// finished playing audio. Use [pause] instead if you would like to keep the
   /// decoders alive so that the app can quickly resume audio playback.
   Future<void> stop() async {
+    _sourceRequest++;
+    await _stop();
+  }
+
+  Future<void> _stop() async {
     if (_disposed) return;
     final future =
         _setPlatformActive(false)?.catchError((dynamic e) async => null);
@@ -1078,6 +1096,7 @@ class AudioPlayer {
     final previouslyEnabled = skipSilenceEnabled;
     if (enabled == previouslyEnabled) return;
     _skipSilenceEnabledSubject.add(enabled);
+    if (_sourcePlatform != null) return;
     try {
       await (await _platform)
           .setSkipSilence(SetSkipSilenceRequest(enabled: enabled));
@@ -1248,7 +1267,7 @@ class AudioPlayer {
 
   Future<void> _internalSetAndroidAudioAttributes(AudioPlayerPlatform platform,
       AndroidAudioAttributes audioAttributes) async {
-    if (!_isAndroid() && !_isUnitTest()) return;
+    if (_sourcePlatform != null || (!_isAndroid() && !_isUnitTest())) return;
     await platform.setAndroidAudioAttributes(SetAndroidAudioAttributesRequest(
         contentType: audioAttributes.contentType.index,
         flags: audioAttributes.flags.value,
@@ -1462,7 +1481,8 @@ class AudioPlayer {
       // During initialisation, we must only use this platform reference in case
       // _platform is updated again during initialisation.
       final platform = active
-          ? await (_nativePlatform = _pluginPlatform.init(InitRequest(
+          ? await (_nativePlatform =
+              (_sourcePlatform ?? _pluginPlatform).init(InitRequest(
               id: _id,
               audioLoadConfiguration: _audioLoadConfiguration?._toMessage(),
               androidAudioEffects: (_isAndroid() || _isUnitTest())
@@ -1596,7 +1616,8 @@ class AudioPlayer {
     } else {
       _nativePlatform = null;
       try {
-        await _pluginPlatform.disposePlayer(DisposePlayerRequest(id: _id));
+        await (_sourcePlatform ?? _pluginPlatform)
+            .disposePlayer(DisposePlayerRequest(id: _id));
       } catch (e) {
         // Fallback if disposePlayer hasn't been implemented.
         await platform.dispose(DisposeRequest());

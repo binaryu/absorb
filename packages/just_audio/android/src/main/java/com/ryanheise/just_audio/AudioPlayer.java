@@ -428,6 +428,8 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
 
     @Override
     public void onPlayerError(PlaybackException error) {
+        final Map<String, Object> details = mapOf(
+                "index", currentIndex, "exoErrorCode", error.getErrorCodeName());
         if (error instanceof ExoPlaybackException) {
             final ExoPlaybackException exoError = (ExoPlaybackException)error;
             String forwardedMessage = exoError.getMessage();
@@ -456,13 +458,16 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             default:
                 Log.e(TAG, "default ExoPlaybackException: " + exoError.getUnexpectedException().getMessage());
             }
-            // TODO: send both errorCode and type
-            final Map<String, Object> details = mapOf("index", currentIndex);
             if (sourceCause != null) details.put("cause", sourceCause);
             sendError(String.valueOf(exoError.type), forwardedMessage, details);
         } else {
             Log.e(TAG, "default PlaybackException: " + error.getMessage());
-            sendError(String.valueOf(error.errorCode), error.getMessage(), mapOf("index", currentIndex));
+            sendError(String.valueOf(error.errorCode), error.getMessage(), details);
+        }
+        if (error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED
+                || error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED
+                || error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES) {
+            return;
         }
         errorCount++;
         if (player.hasNextMediaItem() && currentIndex != null && errorCount <= 5) {

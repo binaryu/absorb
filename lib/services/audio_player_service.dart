@@ -46,6 +46,19 @@ export 'player_settings.dart';
 String playbackDownloadKey(String itemId, String? episodeId) =>
     episodeKeyFor(itemId, episodeId);
 
+bool _hasWmaTracks(List<dynamic>? tracks) =>
+    tracks?.whereType<Map>().any((track) {
+      final codec = track['codec']?.toString().toLowerCase();
+      final mime = track['mimeType']?.toString().toLowerCase();
+      return codec == 'wmav1' ||
+          codec == 'wmav2' ||
+          codec == 'wmapro' ||
+          codec == 'wmalossless' ||
+          mime == 'audio/x-ms-wma' ||
+          mime == 'video/x-ms-asf' ||
+          mime == 'application/vnd.ms-asf';
+    }) ?? false;
+
 // ─── AudioHandler (runs in background, controls notification) ───
 
 class AudioPlayerHandler extends BaseAudioHandler with SeekHandler {
@@ -294,6 +307,7 @@ class AudioPlayerHandler extends BaseAudioHandler with SeekHandler {
         _resubscribeCount = 0;
       },
       onError: (Object e, StackTrace st) {
+        if (AudioPlayerService()._tryAndroidFormatFallback(e)) return;
         if (PlaybackErrorPolicy.isSourceError(e)) {
           debugPrint(
             '[Player] playbackEvent source error - restarting stream: $e',
@@ -1973,6 +1987,7 @@ class AudioPlayerService extends ChangeNotifier {
   }
 
   void _maybePreloadNextBook() {
+    if (_player?.usingAndroidMpv ?? false) return;
     if (_nextBookPreloading) return;
     if (_preloadedNextBook != null) return;
     if (_activeConcatSource == null) return;
@@ -2069,6 +2084,13 @@ class AudioPlayerService extends ChangeNotifier {
         debugPrint(
           '[PreBuffer] Next item is multi-track, skipping (MVP supports single-track only)',
         );
+        return;
+      }
+      if (AppPlatform.isAndroid &&
+          ((_player?.usingAndroidMpv ?? false) ||
+              _hasWmaTracks(audioTracks) ||
+              nextTrackSources.any(AudioPlayer.isWmaSource))) {
+        // A separate load chooses the backend for the next book.
         return;
       }
 
@@ -4608,6 +4630,7 @@ class AudioPlayerService extends ChangeNotifier {
       final decoded = await _player!.setAudioSource(
         source,
         itemId: rawItemId,
+        hasWmaTracks: _hasWmaTracks(audioTracks),
       );
       if (_startSuperseded(gen)) {
         return _abandonStart(null, null, 'local, after loading the source');
@@ -5350,7 +5373,11 @@ class AudioPlayerService extends ChangeNotifier {
         return _abandonStart(api, ownSessionId, 'before loading the source');
       }
       _resetPreBufferState();
-      await _player!.setAudioSource(source, itemId: itemId);
+      await _player!.setAudioSource(
+        source,
+        itemId: itemId,
+        hasWmaTracks: sessionPlayMethod == 0 && _hasWmaTracks(audioTracks),
+      );
       if (_startSuperseded(gen)) {
         return _abandonStart(api, ownSessionId, 'after loading the source');
       }
@@ -6195,11 +6222,22 @@ class AudioPlayerService extends ChangeNotifier {
 
   static const _swapLoadTimeout = Duration(seconds: 15);
 
+  bool _tryAndroidFormatFallback(Object error) =>
+      _player?.handleUnsupportedAndroidFormat(error, onFailure: (failure) {
+        debugPrint('[Player] mpv format fallback failed: $failure');
+        if (_localSessionMode) {
+          unawaited(_recoverLocalPlayback(failure));
+        } else {
+          unawaited(_retryWithTranscode());
+        }
+      }) ?? false;
+
   /// Attempt to recover from a stream error by restarting playback from the
   /// last known position.  Tries up to [_maxStreamRetries] times with
   /// exponential back-off (1s, 2s, 4s).  If the item has been downloaded in
   /// the meantime, falls back to local files automatically.
   Future<void> _attemptStreamRetry(Object error) async {
+    if (_tryAndroidFormatFallback(error)) return;
     if (_retryInProgress) return;
     if (_currentItemId == null || _api == null) return;
     if (_streamRetryCount >= _maxStreamRetries) {

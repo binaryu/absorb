@@ -3,6 +3,12 @@ import 'package:flutter/services.dart';
 class PlaybackErrorPolicy {
   PlaybackErrorPolicy._();
 
+  static bool isUnsupportedExoFormat(Object? errorCode) {
+    return errorCode == 'ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED' ||
+        errorCode == 'ERROR_CODE_DECODING_FORMAT_UNSUPPORTED' ||
+        errorCode == 'ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES';
+  }
+
   static bool isSourceError(Object error) {
     final text = error.toString().toLowerCase();
 

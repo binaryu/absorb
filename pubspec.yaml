@@ -38,8 +38,10 @@ dependencies:
   audio_service:
     path: packages/audio_service
 
-  # Windows has no just_audio engine of its own; this plays through libmpv.
+  # libmpv powers Windows playback and unsupported formats on Android.
   just_audio_media_kit: ^2.1.0
+  media_kit: ^1.2.6
+  media_kit_libs_android_audio: ^1.3.8
   media_kit_libs_windows_audio: ^1.0.9
 
   # On-device bookmark transcription (Whisper, opt-in). No ffmpeg companion:

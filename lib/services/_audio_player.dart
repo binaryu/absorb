@@ -1,6 +1,11 @@
 import 'dart:async';
+import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:just_audio/just_audio.dart' as ja;
+import 'package:just_audio_media_kit/just_audio_media_kit.dart';
+import 'package:media_kit/media_kit.dart' show MediaKit;
 import 'native_ios_audio_player.dart';
+import 'playback_error_policy.dart';
 import '../utils/app_platform.dart';
 
 // Re-export just_audio's data types so consumers don't need a second import.
@@ -38,6 +43,35 @@ class AudioPlayer {
 
   ja.AudioPlayer? _ja;
   NativeIosAudioPlayer? _native;
+  static JustAudioMediaKit? _androidMpv;
+  ja.AudioSource? _androidSource;
+  bool _usingMpv = false;
+  bool _loadingAndroidSource = false;
+  bool? _resumeAfterFormatFallback;
+  int _androidLoad = 0;
+
+  static JustAudioMediaKit _mpvBackend() {
+    if (_androidMpv case final backend?) return backend;
+    MediaKit.ensureInitialized();
+    return _androidMpv ??= JustAudioMediaKit();
+  }
+
+  static bool isWmaSource(ja.AudioSource source) =>
+      source is ja.UriAudioSource &&
+      RegExp(r'\.(wma|asf)$', caseSensitive: false).hasMatch(source.uri.path);
+
+  bool get usingAndroidMpv => _usingMpv;
+
+  static bool isUnsupportedAndroidFormat(Object error) {
+    final details = switch (error) {
+      ja.PlayerException() => error.details,
+      PlatformException() => error.details,
+      _ => null,
+    };
+    return AppPlatform.isAndroid &&
+        details is Map &&
+        PlaybackErrorPolicy.isUnsupportedExoFormat(details['exoErrorCode']);
+  }
 
   bool get _isNative => _native != null;
 
@@ -93,13 +127,93 @@ class AudioPlayer {
     int? initialIndex,
     bool preload = true,
     String? itemId,
+    bool hasWmaTracks = false,
   }) async {
     if (_isNative) {
       return _native!.setAudioSource(source, initialPosition: initialPosition, initialIndex: initialIndex, preload: preload, itemId: itemId);
     }
     // just_audio doesn't track an item id; it's only meaningful for the iOS
     // engine, which uses it to recognise a book on widget-driven resume.
-    return _ja!.setAudioSource(source, initialPosition: initialPosition, initialIndex: initialIndex, preload: preload);
+    if (!AppPlatform.isAndroid) {
+      return _ja!.setAudioSource(source, initialPosition: initialPosition, initialIndex: initialIndex, preload: preload);
+    }
+
+    final request = ++_androidLoad;
+    _androidSource = null;
+    _loadingAndroidSource = true;
+    _resumeAfterFormatFallback = null;
+    _usingMpv = hasWmaTracks || source.sequence.any(isWmaSource);
+    try {
+      Future<Duration?> load() => _ja!.setAudioSource(
+        source,
+        initialPosition: initialPosition,
+        initialIndex: initialIndex,
+        preload: preload,
+        platformOverride: _usingMpv ? _mpvBackend() : null,
+      );
+      Duration? duration;
+      try {
+        duration = await load();
+      } catch (error) {
+        if (request != _androidLoad ||
+            _usingMpv ||
+            !isUnsupportedAndroidFormat(error)) {
+          rethrow;
+        }
+        debugPrint('[Player] Unsupported ExoPlayer format, retrying with mpv');
+        _usingMpv = true;
+        duration = await load();
+      }
+      if (request == _androidLoad) _androidSource = source;
+      return duration;
+    } finally {
+      if (request == _androidLoad) _loadingAndroidSource = false;
+    }
+  }
+
+  /// Consumes the native error while a load is handling it, or reloads the
+  /// existing queue on mpv when a later track turns out to be unsupported.
+  bool handleUnsupportedAndroidFormat(
+    Object error, {
+    required void Function(Object error) onFailure,
+  }) {
+    if (!isUnsupportedAndroidFormat(error)) return false;
+    if (_loadingAndroidSource) return true;
+    final source = _androidSource;
+    if (_usingMpv || source == null) return false;
+    final details = error is ja.PlayerException
+        ? error.details
+        : (error as PlatformException).details as Map;
+    final index = details['index'] as int? ?? currentIndex ?? 0;
+    final resumePosition = index == currentIndex ? position : Duration.zero;
+    final request = ++_androidLoad;
+    _usingMpv = true;
+    _loadingAndroidSource = true;
+    _resumeAfterFormatFallback = playing;
+    debugPrint('[Player] Unsupported track at index $index, retrying with mpv');
+    unawaited(() async {
+      try {
+        await _ja!.setAudioSource(
+          source,
+          initialIndex: index,
+          initialPosition: resumePosition,
+          platformOverride: _mpvBackend(),
+        );
+        if (request == _androidLoad && _resumeAfterFormatFallback == true) {
+          unawaited(play().catchError((Object error) {
+            if (request == _androidLoad) onFailure(error);
+          }));
+        }
+      } catch (error) {
+        if (request == _androidLoad) onFailure(error);
+      } finally {
+        if (request == _androidLoad) {
+          _loadingAndroidSource = false;
+          _resumeAfterFormatFallback = null;
+        }
+      }
+    }());
+    return true;
   }
 
   /// Pre-buffer the next book so cross-book transitions are gapless.
@@ -135,8 +249,17 @@ class AudioPlayer {
   // ─── Control ───
 
   Future<void> play() => _isNative ? _native!.play() : _ja!.play();
-  Future<void> pause() => _isNative ? _native!.pause() : _ja!.pause();
-  Future<void> stop() => _isNative ? _native!.stop() : _ja!.stop();
+  Future<void> pause() {
+    if (_resumeAfterFormatFallback != null) _resumeAfterFormatFallback = false;
+    return _isNative ? _native!.pause() : _ja!.pause();
+  }
+  Future<void> stop() {
+    _androidLoad++;
+    _androidSource = null;
+    _loadingAndroidSource = false;
+    _resumeAfterFormatFallback = null;
+    return _isNative ? _native!.stop() : _ja!.stop();
+  }
   Future<void> seek(Duration? position, {int? index}) =>
       _isNative ? _native!.seek(position, index: index) : _ja!.seek(position, index: index);
   Future<void> setSpeed(double speed) =>

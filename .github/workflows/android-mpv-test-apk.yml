@@ -27,11 +27,51 @@ jobs:
         with:
           flutter-version: ${{ steps.flutter.outputs.version }}
 
-      - name: Build test APK
-        run: flutter build apk --debug --flavor dev --target-platform android-arm64
+      - name: Create test signing key
+        run: |
+          keytool -genkeypair -keystore "$RUNNER_TEMP/absorb-dev.jks" \
+            -storepass android -keypass android -alias androiddebugkey \
+            -dname "CN=Absorb Dev" -keyalg RSA -keysize 2048 -validity 3650
+          cat > android/key.properties <<EOF
+          storeFile=$RUNNER_TEMP/absorb-dev.jks
+          storePassword=android
+          keyAlias=androiddebugkey
+          keyPassword=android
+          EOF
+
+      - name: Build ARM64 release test APK
+        run: |
+          flutter build apk --release --flavor dev --split-per-abi --target-platform android-arm64
+          apks=(build/app/outputs/apk/dev/release/*-arm64-v8a.apk)
+          test "${#apks[@]}" -eq 1
+          cp "${apks[0]}" absorb-dev-arm64-release.apk
+
+      - name: Report APK size
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from collections import defaultdict
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          apk = Path("absorb-dev-arm64-release.apk")
+          with ZipFile(apk) as archive:
+              entries = archive.infolist()
+              abis = {entry.filename.split("/")[1] for entry in entries if entry.filename.startswith("lib/") and entry.filename.endswith(".so")}
+              assert abis == {"arm64-v8a"}, abis
+              sizes = defaultdict(int)
+              for entry in entries:
+                  sizes[entry.filename.split("/")[0]] += entry.file_size
+              print(f"APK: {apk.stat().st_size / 2**20:.1f} MiB")
+              print(f"Uncompressed: {sum(sizes.values()) / 2**20:.1f} MiB")
+              for name, size in sorted(sizes.items(), key=lambda item: -item[1])[:5]:
+                  print(f"- {name}: {size / 2**20:.1f} MiB")
+              for name in ("libmpv.so", "libmediakitandroidhelper.so"):
+                  size = archive.getinfo(f"lib/arm64-v8a/{name}").file_size
+                  print(f"- {name}: {size / 2**20:.1f} MiB")
+          PY
 
       - uses: actions/upload-artifact@v4
         with:
-          name: absorb-dev-android-arm64
-          path: build/app/outputs/flutter-apk/app-dev-debug.apk
+          name: absorb-dev-arm64-release
+          path: absorb-dev-arm64-release.apk
           if-no-files-found: error
